@@ -2,15 +2,20 @@ name: PASS Checker
 
 on:
   schedule:
-    - cron: "*/2 * * * *"   # draait elke 15 min (pas aan naar */5 voor elke 5 min)
-  workflow_dispatch: {}       # handmatig starten via Actions
+    - cron: "*/5 * * * *"     # start elke 5 min (UTC)
+  workflow_dispatch: {}        # handmatig starten
 
 permissions:
-  contents: write             # nodig om state.json terug te kunnen pushen
+  contents: write
+
+concurrency:
+  group: pass-checker
+  cancel-in-progress: true     # voorkom overlap: nieuwe run annuleert oude
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 12        # genoeg voor 5 x ~1 min + overhead
 
     steps:
       - name: Checkout
@@ -29,28 +34,40 @@ jobs:
           pip install playwright python-dotenv requests
           python -m playwright install --with-deps chromium
 
-      - name: Run checker
+      # ⬇️ Hier gebeurt de magie: 5 runs met telkens 60s pauze + commit state.json per iteratie
+      - name: Run checker 5x (± elke minuut)
         env:
           PASS_USER: ${{ secrets.PASS_USER }}
           PASS_PASS: ${{ secrets.PASS_PASS }}
           BASE_URL:  ${{ secrets.BASE_URL }}
-          CALENDAR_URL: ""  # leeg laten: via de 'Schedule'-knop
+          CALENDAR_URL: ""  # via 'Schedule' klikken
           CALENDAR_SELECTOR: ${{ secrets.CALENDAR_SELECTOR }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           HEADLESS: "true"
           TEST_PING_WHEN_NO_DAYS: ${{ secrets.TEST_PING_WHEN_NO_DAYS }}
         run: |
-          python check_pass.py
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Commit state.json if changed
-        run: |
-          if [ -f "state.json" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add state.json || true
-            if ! git diff --cached --quiet; then
-              git commit -m "chore: update state.json [skip ci]"
-              git push
+          for i in 1 2 3 4 5; do
+            echo "===== RUN $i/5 ====="
+            # Laat de checker nooit de hele job laten falen
+            python check_pass.py || true
+
+            # Commit direct, zodat state niet verloren gaat als deze run wordt gecanceld
+            if [ -f "state.json" ]; then
+              git add state.json || true
+              if ! git diff --cached --quiet; then
+                git commit -m "chore: update state.json [skip ci] (iter $i)"
+                git push
+              fi
             fi
-          fi
+
+            if [ $i -lt 5 ]; then
+              echo "Wachten 60s..."
+              sleep 60
+            fi
+          done
+
