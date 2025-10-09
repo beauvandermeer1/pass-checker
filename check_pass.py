@@ -1,13 +1,13 @@
 import os, hashlib, json, re
-from playwright.sync_api import Error as PWError, TimeoutError
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Error as PWError
 import requests
 
 load_dotenv()
 
+# --------- Config uit env / secrets ----------
 TEST_PING_WHEN_NO_DAYS = os.getenv("TEST_PING_WHEN_NO_DAYS", "false").lower() == "true"
 PASS_USER = os.getenv("PASS_USER", "")
 PASS_PASS = os.getenv("PASS_PASS", "")
@@ -16,26 +16,51 @@ CALENDAR_URL = os.getenv("CALENDAR_URL", "")
 CALENDAR_SELECTOR = os.getenv("CALENDAR_SELECTOR", "")
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
+# primair (jij)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+NOTIFY_PREFIX      = os.getenv("NOTIFY_PREFIX", "")
+
+# vriend (extra ontvanger)
+FRIEND_TELEGRAM_BOT_TOKEN = os.getenv("FRIEND_TELEGRAM_BOT_TOKEN")
+FRIEND_TELEGRAM_CHAT_ID   = os.getenv("FRIEND_TELEGRAM_CHAT_ID")
+FRIEND_NOTIFY_PREFIX      = os.getenv("FRIEND_NOTIFY_PREFIX", "")
+
 STATE_FILE = Path("state.json")
 
+# --------- Helpers ----------
 def has_availability(text: str) -> bool:
     """
     True als er wél dagen beschikbaar zijn (dus de 'geen dagen' tekst ontbreekt).
-    We checken op NL/EN varianten voor de zekerheid.
+    Check NL/EN varianten.
     """
     pattern = r"(geen\s+dagen\s+gevonden|geen\s+dagen\s+beschikbaar|no\s+days\s+found)"
     return not re.search(pattern, text, flags=re.I)
 
+def _send_telegram(token: str, chat_id: str, msg: str) -> bool:
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg},
+            timeout=10
+        )
+        return True
+    except Exception:
+        return False
+
 def notify(msg: str):
-    tok = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat = os.getenv("TELEGRAM_CHAT_ID")
-    if tok and chat:
-        try:
-            requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                          json={"chat_id": chat, "text": msg}, timeout=10)
-        except Exception:
-            print(msg)
-    else:
+    """Stuur melding naar jouw bot én (indien ingesteld) naar de bot van je vriend."""
+    any_sent = False
+
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        m = f"{NOTIFY_PREFIX}{msg}" if NOTIFY_PREFIX else msg
+        any_sent = _send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, m) or any_sent
+
+    if FRIEND_TELEGRAM_BOT_TOKEN and FRIEND_TELEGRAM_CHAT_ID:
+        m2 = f"{FRIEND_NOTIFY_PREFIX}{msg}" if FRIEND_NOTIFY_PREFIX else msg
+        any_sent = _send_telegram(FRIEND_TELEGRAM_BOT_TOKEN, FRIEND_TELEGRAM_CHAT_ID, m2) or any_sent
+
+    if not any_sent:
         print(msg)
 
 def normalize(text: str) -> str:
@@ -114,7 +139,6 @@ def extract_calendar_text(page):
 
 def read_calendar_resilient(context, page):
     """Lees de kalendertekst en herstel als het tabblad onderweg wisselt/sluit."""
-    # pak altijd de laatste/actieve tab
     if len(context.pages) > 0:
         page = context.pages[-1]
     page.wait_for_selector("body", timeout=20000)
@@ -122,7 +146,6 @@ def read_calendar_resilient(context, page):
     try:
         return extract_calendar_text(page)
     except PWError:
-        # opnieuw proberen met het (mogelijk) nieuwe tabblad
         if len(context.pages) > 0:
             page = context.pages[-1]
             page.wait_for_selector("body", timeout=20000)
@@ -130,9 +153,10 @@ def read_calendar_resilient(context, page):
             return extract_calendar_text(page)
         raise
 
+# --------- Hoofdflow ----------
 def run_check():
     if not (PASS_USER and PASS_PASS and BASE_URL):
-        raise SystemExit("Vul PASS_USER, PASS_PASS en BASE_URL in .env in.")
+        raise SystemExit("Vul PASS_USER, PASS_PASS en BASE_URL in .env / secrets in.")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -148,23 +172,20 @@ def run_check():
             if CALENDAR_URL:
                 page.goto(CALENDAR_URL, wait_until="domcontentloaded", timeout=45000)
             else:
-                clicked = try_click_any(page, [
+                try_click_any(page, [
                     'button:has-text("Schedule")', 'a:has-text("Schedule")',
                     'a[href*="/testRounds/"]'
                 ], timeout_ms=6000)
-                # domcontentloaded is vaak sneller beschikbaar dan networkidle
                 page.wait_for_load_state("domcontentloaded", timeout=30000)
 
-            # sommige acties openen/verwisselen het tabblad – pak altijd de laatste
             if len(context.pages) > 0:
                 page = context.pages[-1]
 
-            # Data lezen met herstel bij tab-swap
+            # Data lezen
             text = read_calendar_resilient(context, page)
 
         except (PWError, Exception) as e:
             try:
-                # Probeer nog een snapshot te bewaren voor debug
                 if len(context.pages) > 0:
                     p_last = context.pages[-1]
                     p_last.screenshot(path="error_screenshot.png", full_page=True)
@@ -178,24 +199,23 @@ def run_check():
             context.close()
             browser.close()
 
-        # ---- Beschikbaarheidslogica op tekst ----
+    # ---- Beschikbaarheidslogica op tekst ----
     available_now = has_availability(text)
-	
+
     state = load_state()
     was_available = bool(state.get("available", False))
 
-    # Sla altijd op wanneer we voor het laatst keken + (optioneel) hash voor debug
     state["last_seen"] = datetime.now().isoformat(timespec="seconds")
     state["available"] = available_now
-    state["calendar_hash"] = calc_hash(text)  # puur handig voor debug/geschiedenis
+    state["calendar_hash"] = calc_hash(text)  # handig voor debug
     save_state(state)
 
-    # TESTMODUS: stuur een ping als er GEEN dagen zijn (om Telegram te testen)
+    # Testmodus: ping sturen als er GEEN dagen zijn (om Telegram te testen)
     if TEST_PING_WHEN_NO_DAYS and not available_now:
         notify("🧪 Testping: 'Geen dagen gevonden.' is zichtbaar — melding werkt ✅")
 
+    # Normale meldlogica: alleen bij overgang naar beschikbaar
     if available_now and not was_available:
-        # Overgang: van 'geen dagen' -> 'wel dagen' => ping!
         notify("🎉 Er zijn NU dagen beschikbaar op PASS. Snel inloggen en plannen!")
     else:
         print("[INFO] Geen nieuwe beschikbaarheid.")
