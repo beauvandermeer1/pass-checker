@@ -44,6 +44,10 @@ jobs:
           CALENDAR_SELECTOR: ${{ secrets.CALENDAR_SELECTOR }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          FRIEND_TELEGRAM_BOT_TOKEN: ${{ secrets.FRIEND_TELEGRAM_BOT_TOKEN }}
+          FRIEND_TELEGRAM_CHAT_ID:   ${{ secrets.FRIEND_TELEGRAM_CHAT_ID }}
+          NOTIFY_PREFIX: "[Beau] "
+          FRIEND_NOTIFY_PREFIX: "[Flip]"
           HEADLESS: "true"
           TEST_PING_WHEN_NO_DAYS: ${{ secrets.TEST_PING_WHEN_NO_DAYS }}
         run: |
