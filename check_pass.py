@@ -15,7 +15,7 @@ PASS_PASS = os.getenv("PASS_PASS", "")
 BASE_URL  = os.getenv("BASE_URL", "")
 CALENDAR_URL = os.getenv("CALENDAR_URL", "")
 CALENDAR_SELECTOR = os.getenv("CALENDAR_SELECTOR", "")
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+HEADLESS = os.getenv("HEADLESS", "")
 
 # primair (jij)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -326,3 +326,4 @@ def run_check():
 
 if __name__ == "__main__":
     run_check()
+
