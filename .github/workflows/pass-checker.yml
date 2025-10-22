@@ -2,11 +2,11 @@ name: PASS Checker
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # elke 5 minuten
+    - cron: "*/5 * * * *"   # fallback: elke 5 min een nieuwe lange run
   workflow_dispatch: {}      # handmatig starten
 
 permissions:
-  contents: write            # nodig om state.json te kunnen committen (optioneel)
+  contents: write
 
 concurrency:
   group: pass-checker
@@ -15,51 +15,30 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 360   # GH max ~360 min (6 uur)
+
+    env:
+      CHECK_INTERVAL_SEC: 2   # ⬅️ interval tussen checks (stel 0–5 in voor “zo snel mogelijk”)
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      # Installeer Playwright + Chromium + overige libs
       - name: Install dependencies and browsers
         run: |
           python -m pip install --upgrade pip
           pip install playwright python-dotenv requests
           python -m playwright install --with-deps chromium
 
-      # (optioneel) snelle check dat secrets/flags aanwezig zijn
-      - name: Debug env presence
-        run: |
-          python - << 'PY'
-          import os
-          for k in [
-            "PASS_USER","PASS_PASS","BASE_URL",
-            "TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID",
-            "FRIEND_TELEGRAM_BOT_TOKEN","FRIEND_TELEGRAM_CHAT_ID",
-            "AUTO_BOOK","HEADLESS","TEST_PING_WHEN_NO_DAYS","BOOKING_TEST_MODE"
-          ]:
-            print(f"{k}: ", "set" if os.getenv(k) else "MISSING")
-          PY
-        env:
-          PASS_USER:  ${{ secrets.PASS_USER }}
-          PASS_PASS:  ${{ secrets.PASS_PASS }}
-          BASE_URL:   ${{ secrets.BASE_URL }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          FRIEND_TELEGRAM_BOT_TOKEN: ${{ secrets.FRIEND_TELEGRAM_BOT_TOKEN }}
-          FRIEND_TELEGRAM_CHAT_ID:   ${{ secrets.FRIEND_TELEGRAM_CHAT_ID }}
-          AUTO_BOOK:  ${{ secrets.AUTO_BOOK }}
-          HEADLESS:   ${{ secrets.HEADLESS }}
-          TEST_PING_WHEN_NO_DAYS: ${{ secrets.TEST_PING_WHEN_NO_DAYS }}
-          BOOKING_TEST_MODE: ${{ secrets.BOOKING_TEST_MODE }}
-
-      - name: Run checker
+      - name: Run checker continuously (up to ~5h50m)
         env:
           # Login / navigatie
           PASS_USER:  ${{ secrets.PASS_USER }}
@@ -67,26 +46,53 @@ jobs:
           BASE_URL:   ${{ secrets.BASE_URL }}
           CALENDAR_URL: ""
           CALENDAR_SELECTOR: ${{ secrets.CALENDAR_SELECTOR }}
-
-          # Telegram (jij)
+          # Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           NOTIFY_PREFIX: "[Beau] "
-
-          # Telegram (vriend)
           FRIEND_TELEGRAM_BOT_TOKEN: ${{ secrets.FRIEND_TELEGRAM_BOT_TOKEN }}
           FRIEND_TELEGRAM_CHAT_ID:   ${{ secrets.FRIEND_TELEGRAM_CHAT_ID }}
           FRIEND_NOTIFY_PREFIX: "[Philip] "
+          # Flags
+          AUTO_BOOK:  ${{ secrets.AUTO_BOOK }}
+          HEADLESS:   ${{ secrets.HEADLESS }}
+          TEST_PING_WHEN_NO_DAYS: ${{ secrets.TEST_PING_WHEN_NO_DAYS }}
+          BOOKING_TEST_MODE: ${{ secrets.BOOKING_TEST_MODE }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Flags/opties (strings)
-          AUTO_BOOK:  ${{ secrets.AUTO_BOOK }}                # bv. "true"
-          HEADLESS:   ${{ secrets.HEADLESS }}                 # bv. "true"
-          TEST_PING_WHEN_NO_DAYS: ${{ secrets.TEST_PING_WHEN_NO_DAYS }}   # "false"
-          BOOKING_TEST_MODE: ${{ secrets.BOOKING_TEST_MODE }} # "none" | "inject" | "dry-run"
-        run: python check_pass.py
+          START=$(date +%s)
+          # eindig na ~5h50m zodat we onder 6 uur blijven
+          END=$(( START + 21000 ))
 
-      # Artefacts voor debug (html/png/state)
-      - name: Upload artifacts
+          iter=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            iter=$((iter+1))
+            echo "===== CHECK $iter ===== $(date -Iseconds)"
+
+            # run je checker (faal niet hard, we willen door blijven lopen)
+            python check_pass.py || echo "[WARN] check_pass.py returned non-zero"
+
+            # eventueel state.json committen
+            if [ -f "state.json" ]; then
+              git add state.json || true
+              if ! git diff --cached --quiet; then
+                git pull --rebase || true
+                git commit -m "chore: update state.json [skip ci] (iter $iter)" || true
+                git push || true
+              fi
+            fi
+
+            # wacht even voor de volgende check
+            if [ "$CHECK_INTERVAL_SEC" -gt 0 ]; then
+              echo "Sleeping ${CHECK_INTERVAL_SEC}s..."
+              sleep "$CHECK_INTERVAL_SEC"
+            fi
+          done
+
+      - name: Upload artifacts (html/png) from last run
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -96,4 +102,5 @@ jobs:
             *.html
             state.json
           if-no-files-found: ignore
+
 
