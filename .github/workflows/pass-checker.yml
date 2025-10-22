@@ -2,8 +2,8 @@ name: PASS Checker (continuous)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"     # fallback: elke 5 min start een nieuwe lange run
-  workflow_dispatch: {}        # handmatig starten
+    - cron: "1 */6 * * *"   # om 08 min na elk 6e uur
+  workflow_dispatch: {}
 
 permissions:
   contents: write              # voor (optioneel) state.json commits
