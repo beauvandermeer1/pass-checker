@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}        # handmatig starten
 
 permissions:
-  contents: write              # voor state.json push
+  contents: write
 
 concurrency:
   group: pass-checker
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    # ✅ Betrouwbaar: Playwright container (Chrome + deps al aanwezig)
+    # ✅ Chromium + Playwright voorgeïnstalleerd
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
@@ -28,7 +28,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Install deps (playwright zit al in de image)
+      - name: Install deps (python libs)
         run: |
           python -m pip install --upgrade pip
           pip install python-dotenv requests
@@ -37,15 +37,13 @@ jobs:
         run: |
           python - << 'PY'
           import os
-          keys = [
+          for k in [
             "PASS_USER","PASS_PASS","BASE_URL",
             "TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID",
             "FRIEND_TELEGRAM_BOT_TOKEN","FRIEND_TELEGRAM_CHAT_ID",
             "AUTO_BOOK","HEADLESS","TEST_PING_WHEN_NO_DAYS","BOOKING_TEST_MODE"
-          ]
-          for k in keys:
-            v = os.getenv(k)
-            print(f"{k}: ", "set" if v else "MISSING")
+          ]:
+            print(f"{k}: ", "set" if os.getenv(k) else "MISSING")
           PY
         env:
           PASS_USER:  ${{ secrets.PASS_USER }}
@@ -60,63 +58,28 @@ jobs:
           TEST_PING_WHEN_NO_DAYS: ${{ secrets.TEST_PING_WHEN_NO_DAYS }}
           BOOKING_TEST_MODE: ${{ secrets.BOOKING_TEST_MODE }}
 
-      # 🔁 Elke run 5x uitvoeren → ~elke minuut
-      - name: Run checker 5x (≈ elke minuut)
+      - name: Run checker 1x
         env:
           PASS_USER:  ${{ secrets.PASS_USER }}
           PASS_PASS:  ${{ secrets.PASS_PASS }}
           BASE_URL:   ${{ secrets.BASE_URL }}
           CALENDAR_URL: ""
           CALENDAR_SELECTOR: ${{ secrets.CALENDAR_SELECTOR }}
-
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           FRIEND_TELEGRAM_BOT_TOKEN: ${{ secrets.FRIEND_TELEGRAM_BOT_TOKEN }}
           FRIEND_TELEGRAM_CHAT_ID:   ${{ secrets.FRIEND_TELEGRAM_CHAT_ID }}
           NOTIFY_PREFIX: "[Beau] "
           FRIEND_NOTIFY_PREFIX: "[Philip] "
-
           AUTO_BOOK:  ${{ secrets.AUTO_BOOK }}
           HEADLESS:   ${{ secrets.HEADLESS }}
           TEST_PING_WHEN_NO_DAYS: ${{ secrets.TEST_PING_WHEN_NO_DAYS }}
           BOOKING_TEST_MODE: ${{ secrets.BOOKING_TEST_MODE }}
         run: |
           set -e
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          python check_pass.py
 
-          for i in 1 2 3 4 5; do
-            echo "===== RUN $i/5 ====="
-            # trace aan voor betere debug
-            python - << 'PY'
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-              b = p.chromium.launch()
-              c = b.new_context(record_har_path=f"trace_iter{i}.har")
-              c.close()
-              b.close()
-            PY
-            # echte run
-            python check_pass.py || true
-
-            # commit state.json als die veranderde
-            if [ -f "state.json" ]; then
-              git add state.json || true
-              if ! git diff --cached --quiet; then
-                git pull --rebase || true
-                git commit -m "chore: update state.json [skip ci] (iter $i)"
-                git push || true
-              fi
-            fi
-
-            if [ $i -lt 5 ]; then
-              echo "Wachten 60s..."
-              sleep 60
-            fi
-          done
-
-      # 📎 Upload debug artefacts (HTML/PNG/trace) ongeacht succes
-      - name: Upload artefacts
+      - name: Upload artifacts (html/png)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -124,8 +87,8 @@ jobs:
           path: |
             *.png
             *.html
-            *.har
             state.json
           if-no-files-found: ignore
+
 
 
