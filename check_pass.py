@@ -9,6 +9,7 @@ load_dotenv()
 
 # --------- Config uit env / secrets ----------
 TEST_PING_WHEN_NO_DAYS = os.getenv("TEST_PING_WHEN_NO_DAYS", "false").lower() == "true"
+AUTO_BOOK = os.getenv("AUTO_BOOK", "false").lower() == "true"   # zet op true als je wilt auto-boeken
 PASS_USER = os.getenv("PASS_USER", "")
 PASS_PASS = os.getenv("PASS_PASS", "")
 BASE_URL  = os.getenv("BASE_URL", "")
@@ -48,20 +49,31 @@ def _send_telegram(token: str, chat_id: str, msg: str) -> bool:
     except Exception:
         return False
 
-def notify(msg: str):
-    """Stuur melding naar jouw bot én (indien ingesteld) naar de bot van je vriend."""
+def notify_both(msg: str):
+    """Stuur dezelfde melding naar jou én (indien ingesteld) naar je vriend."""
     any_sent = False
-
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         m = f"{NOTIFY_PREFIX}{msg}" if NOTIFY_PREFIX else msg
         any_sent = _send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, m) or any_sent
-
     if FRIEND_TELEGRAM_BOT_TOKEN and FRIEND_TELEGRAM_CHAT_ID:
         m2 = f"{FRIEND_NOTIFY_PREFIX}{msg}" if FRIEND_NOTIFY_PREFIX else msg
         any_sent = _send_telegram(FRIEND_TELEGRAM_BOT_TOKEN, FRIEND_TELEGRAM_CHAT_ID, m2) or any_sent
-
     if not any_sent:
         print(msg)
+
+def notify_self(msg: str):
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        m = f"{NOTIFY_PREFIX}{msg}" if NOTIFY_PREFIX else msg
+        if not _send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, m):
+            print(msg)
+    else:
+        print(msg)
+
+def notify_friend(msg: str):
+    if FRIEND_TELEGRAM_BOT_TOKEN and FRIEND_TELEGRAM_CHAT_ID:
+        m2 = f"{FRIEND_NOTIFY_PREFIX}{msg}" if FRIEND_NOTIFY_PREFIX else msg
+        if not _send_telegram(FRIEND_TELEGRAM_BOT_TOKEN, FRIEND_TELEGRAM_CHAT_ID, m2):
+            print(msg)
 
 def normalize(text: str) -> str:
     t = re.sub(r"\s+", " ", text)
@@ -153,10 +165,79 @@ def read_calendar_resilient(context, page):
             return extract_calendar_text(page)
         raise
 
+# ---------- Schedule-button zoeken & boeken ----------
+def find_schedule_buttons_sorted(page):
+    """
+    Vind alle 'Schedule' knoppen/links en sorteer op schermpositie (Y-waarde) -> bovenste eerst.
+    We richten ons op de donkerblauwe 'Schedule'-knoppen door op tekst te filteren.
+    """
+    # brede selectors met nadruk op tekst 'Schedule'
+    candidates = [
+        'button:has-text("Schedule")',
+        'a:has-text("Schedule")',
+        '[role="button"]:has-text("Schedule")',
+        'input[type="button"][value*="Schedule"]',
+        'input[type="submit"][value*="Schedule"]'
+    ]
+    locs = []
+    for sel in candidates:
+        try:
+            loc = page.locator(sel)
+            count = loc.count()
+            for i in range(min(count, 50)):
+                locs.append(loc.nth(i))
+        except Exception:
+            continue
+
+    # sorteer op top-positie (y); soms geeft bounding_box None als element offscreen is
+    def y_of(l):
+        try:
+            box = l.bounding_box()
+            return box["y"] if box else 1e9
+        except Exception:
+            return 1e9
+
+    locs_sorted = sorted(locs, key=y_of)
+    return locs_sorted
+
+def auto_book_top_schedule(page):
+    """
+    Klik de visueel bovenste 'Schedule'-knop, bevestig indien nodig,
+    en check heuristisch of de boeking gelukt is.
+    """
+    btns = find_schedule_buttons_sorted(page)
+    if not btns:
+        return {"success": False, "reason": "no-schedule-buttons"}
+
+    # klik de bovenste
+    btns[0].click(timeout=7000)
+
+    # mogelijke bevestiging
+    try_click_any(page, [
+        'button:has-text("Confirm")', 'button:has-text("Bevestig")',
+        'button:has-text("Bevestigen")', 'button:has-text("Yes")', 'button:has-text("Ja")',
+        'input[type="submit"]'
+    ], timeout_ms=4000)
+
+    page.wait_for_load_state("networkidle", timeout=20000)
+
+    # heuristische check op succeswoorden
+    try:
+        body = page.inner_text("body").lower()
+    except Exception:
+        body = ""
+    success_words = ["geboekt", "gepland", "bevestigd", "booked", "scheduled", "confirmed"]
+    ok = any(w in body for w in success_words)
+    return {"success": ok, "reason": "ok" if ok else "no-success-text"}
+
 # --------- Hoofdflow ----------
 def run_check():
     if not (PASS_USER and PASS_PASS and BASE_URL):
         raise SystemExit("Vul PASS_USER, PASS_PASS en BASE_URL in .env / secrets in.")
+
+    state = load_state()
+    already_booked = bool(state.get("booked", False))
+    booking_result = None  # vullen we alleen bij poging tot boeken
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -184,6 +265,10 @@ def run_check():
             # Data lezen
             text = read_calendar_resilient(context, page)
 
+            # Auto-book: klik BOVENSTE 'Schedule'-knop als er beschikbaarheid is
+            if AUTO_BOOK and not already_booked and has_availability(text):
+                booking_result = auto_book_top_schedule(page)
+
         except (PWError, Exception) as e:
             try:
                 if len(context.pages) > 0:
@@ -202,24 +287,42 @@ def run_check():
     # ---- Beschikbaarheidslogica op tekst ----
     available_now = has_availability(text)
 
-    state = load_state()
     was_available = bool(state.get("available", False))
-
     state["last_seen"] = datetime.now().isoformat(timespec="seconds")
     state["available"] = available_now
     state["calendar_hash"] = calc_hash(text)  # handig voor debug
+
+    # Als er net is geboekt, markeer dat en meld verschillend aan jou vs vriend
+    if booking_result and booking_result.get("success"):
+        state["booked"] = True
+        save_state(state)
+        notify_self("✅ Slot automatisch GEBOEKT via bovenste 'Schedule'-knop. Check PASS ter bevestiging.")
+        notify_friend("🎉 Er zijn plekken beschikbaar op PASS.")
+        return
+
     save_state(state)
 
     # Testmodus: ping sturen als er GEEN dagen zijn (om Telegram te testen)
     if TEST_PING_WHEN_NO_DAYS and not available_now:
-        notify("🧪 Testping: 'Geen dagen gevonden.' is zichtbaar — melding werkt ✅")
+        notify_both("🧪 Testping: 'Geen dagen gevonden.' is zichtbaar — melding werkt ✅")
 
-    # Normale meldlogica: alleen bij overgang naar beschikbaar
+    # Normale meldlogica:
+    # - Alleen bij overgang naar beschikbaar
+    # - Als auto-book mislukte, stuur jij een waarschuwing; vriend krijgt 'spots available'
     if available_now and not was_available:
-        notify("🎉 Er zijn NU dagen beschikbaar op PASS. Snel inloggen en plannen!")
+        if AUTO_BOOK and not already_booked:
+            if booking_result and not booking_result.get("success"):
+                notify_self(f"⚠️ Dagen gevonden maar automatisch boeken mislukte (reden: {booking_result.get('reason')}). Boek handmatig.")
+                notify_friend("🎉 Er zijn plekken beschikbaar op PASS.")
+            elif booking_result is None:
+                notify_self("⚠️ Dagen gevonden, maar geen 'Schedule'-knop gedetecteerd. Boek handmatig.")
+                notify_friend("🎉 Er zijn plekken beschikbaar op PASS.")
+            # als booking_result success was, zijn we al gereturned
+        else:
+            # geen auto-book: gewoon beide melden dat er plekken zijn
+            notify_both("🎉 Er zijn NU dagen beschikbaar op PASS. Snel inloggen en plannen!")
     else:
         print("[INFO] Geen nieuwe beschikbaarheid.")
-
 
 if __name__ == "__main__":
     run_check()
