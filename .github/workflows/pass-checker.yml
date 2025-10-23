@@ -2,23 +2,23 @@ name: PASS Checker (continuous)
 
 on:
   schedule:
-    - cron: "1 */6 * * *"   # om 08 min na elk 6e uur
-  workflow_dispatch: {}
+    - cron: "1 */6 * * *"     # elke 6 uur om :08 (UTC)
+  workflow_dispatch: {}        # handmatig starten
 
 permissions:
-  contents: write              # voor (optioneel) state.json commits
+  contents: write              # nodig om state.json te committen (optioneel)
 
 concurrency:
   group: pass-checker
-  cancel-in-progress: true     # geen overlap tussen runs
+  cancel-in-progress: true     # geen overlap: nieuwe run annuleert oude
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360       # max ~6 uur per run
+    timeout-minutes: 360       # ~6 uur max per run
 
     env:
-      CHECK_INTERVAL_SEC: 5    # ⬅️ check elke 5 seconden
+      CHECK_INTERVAL_SEC: 2    # check-interval (seconden)
 
     steps:
       - name: Checkout
@@ -73,18 +73,30 @@ jobs:
             iter=$((iter+1))
             echo "===== CHECK $iter ===== $(date -Iseconds)"
 
-            # run je checker (laat fouten de loop niet stoppen)
+            # run checker (laat fouten de loop niet stoppen)
             python check_pass.py || echo "[WARN] check_pass.py returned non-zero"
 
-            # (optioneel) state.json committen als die wijzigt
+            # --- GIT FIX: schoon trekken vóór pull, daarna alleen 'meaningful' commit ---
+            git reset --hard || true
+            git clean -fd || true
+            git pull --rebase || true
+
             if [ -f "state.json" ]; then
-              git add state.json || true
-              if ! git diff --cached --quiet; then
-                git pull --rebase || true
-                git commit -m "chore: update state.json [skip ci] (iter $iter)" || true
+              # tel aantal betekenisvolle diffs (negeer last_seen & calendar_hash)
+              CHANGED_MEANINGFUL=$(git diff -U0 HEAD -- state.json \
+                | grep -E '^\+|^\-' \
+                | grep -Ev '"last_seen"|\"calendar_hash\"' \
+                | wc -l | tr -d ' ')
+              if [ "$CHANGED_MEANINGFUL" -gt 0 ]; then
+                git add state.json || true
+                git commit -m "chore: update state.json (meaningful change) [skip ci] (iter $iter)" || true
                 git push || true
+                echo "[GIT] state.json committed (meaningful change)."
+              else
+                echo "[GIT] only last_seen/calendar_hash changed → skip commit."
               fi
             fi
+            # --- EINDE GIT FIX ---
 
             # interval
             if [ "$CHECK_INTERVAL_SEC" -gt 0 ]; then
@@ -92,7 +104,7 @@ jobs:
             fi
           done
 
-      # Upload alleen bij failures om opslag te sparen
+      # Upload artifacts alleen bij failures (scheelt opslag)
       - name: Upload artifacts (html/png/state) on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -104,3 +116,4 @@ jobs:
             state.json
           retention-days: 3
           if-no-files-found: ignore
+
